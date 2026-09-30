@@ -1,0 +1,23 @@
+# Go 编译产物
+file-view.exe
+file-view-test.exe
+*.test
+*.out
+
+# 运行数据与日志
+file-view.db
+file-view.db-*
+file-view.log
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+~$*
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

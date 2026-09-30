@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录 · File View</title><script src="[[.Base]]/assets/tailwind.browser.js"></script></head>
+<body class="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-5">
+  <div class="fixed inset-0 bg-[radial-gradient(circle_at_top,#164e63_0,transparent_35%)]"></div>
+  <form method="post" action="[[.Base]]/login" class="relative w-full max-w-sm rounded-2xl border border-white/10 bg-slate-900/80 p-7 shadow-2xl backdrop-blur">
+    <div class="mb-7"><div class="text-xs font-semibold tracking-[.25em] text-cyan-400">FILE VIEW</div><h1 class="mt-2 text-2xl font-bold">欢迎回来</h1><p class="mt-1 text-sm text-slate-400">登录后访问共享文件</p></div>
+    [[if .Error]]<div class="mb-4 rounded-lg bg-red-500/10 px-3 py-2 text-sm text-red-300">用户名或密码错误</div>[[end]]
+    <label class="mb-2 block text-sm text-slate-300">用户名</label><input name="username" required autofocus autocomplete="username" class="mb-4 w-full rounded-xl border border-white/10 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500">
+    <label class="mb-2 block text-sm text-slate-300">密码</label><input name="password" type="password" required autocomplete="current-password" class="mb-6 w-full rounded-xl border border-white/10 bg-slate-950 px-4 py-3 outline-none focus:border-cyan-500">
+    <button class="w-full rounded-xl bg-cyan-500 py-3 font-semibold text-slate-950 transition hover:bg-cyan-400">登录</button>
+  </form>
+</body></html>
