@@ -49,6 +49,7 @@ type Config struct {
 type Server struct {
 	cfg      Config
 	root     string
+	rootMu   sync.RWMutex
 	base     string
 	db       *sql.DB
 	sessions map[string]Session
@@ -120,17 +121,6 @@ func run() error {
 	if !filepath.IsAbs(cfg.RootDir) {
 		cfg.RootDir = filepath.Join(exeDir, cfg.RootDir)
 	}
-	root, err := filepath.Abs(cfg.RootDir)
-	if err != nil {
-		return err
-	}
-	if err = os.MkdirAll(root, 0755); err != nil {
-		return fmt.Errorf("创建根目录失败: %w", err)
-	}
-	root, err = filepath.EvalSymlinks(root)
-	if err != nil {
-		return err
-	}
 	indexBytes, _ := webFiles.ReadFile("web/index.html")
 	loginBytes, _ := webFiles.ReadFile("web/login.html")
 	dbPath := filepath.Join(exeDir, "file-view.db")
@@ -140,6 +130,10 @@ func run() error {
 	}
 	defer db.Close()
 	if err = initDatabase(db, cfg); err != nil {
+		return err
+	}
+	root, err := loadRootSetting(db, cfg.RootDir)
+	if err != nil {
 		return err
 	}
 	s := &Server{cfg: cfg, root: root, base: cleanBase(cfg.BasePath), db: db, sessions: map[string]Session{}, previews: map[string]time.Time{}}
@@ -152,7 +146,11 @@ func run() error {
 	mux.HandleFunc(s.base+"/logout", s.logoutHandler)
 	mux.HandleFunc(s.base+"/api/list", s.auth(s.listHandler))
 	mux.HandleFunc(s.base+"/api/upload", s.requireUpload(s.uploadHandler))
+	mux.HandleFunc(s.base+"/api/mkdir", s.requireUpload(s.mkdirHandler))
+	mux.HandleFunc(s.base+"/api/delete", s.requireUpload(s.deleteHandler))
+	mux.HandleFunc(s.base+"/api/rename", s.requireUpload(s.renameHandler))
 	mux.HandleFunc(s.base+"/api/admin/users", s.requireAdmin(s.usersHandler))
+	mux.HandleFunc(s.base+"/api/admin/settings", s.requireAdmin(s.settingsHandler))
 	mux.HandleFunc(s.base+"/api/raw", s.auth(s.rawHandler))
 	mux.HandleFunc(s.base+"/api/download", s.auth(s.downloadHandler))
 	mux.HandleFunc(s.base+"/api/zip", s.auth(s.zipHandler))
@@ -223,6 +221,10 @@ func initDatabase(db *sql.DB, cfg Config) error {
 			is_admin INTEGER NOT NULL DEFAULT 0,
 			can_upload INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
 		);`); err != nil {
 		return fmt.Errorf("初始化用户数据库失败: %w", err)
 	}
@@ -259,6 +261,45 @@ func initDatabase(db *sql.DB, cfg Config) error {
 		log.Printf("已通过 -admin 参数重置管理员密码")
 	}
 	return nil
+}
+
+func loadRootSetting(db *sql.DB, bootstrap string) (string, error) {
+	var configured string
+	err := db.QueryRow(`SELECT value FROM settings WHERE key='root_dir'`).Scan(&configured)
+	if errors.Is(err, sql.ErrNoRows) {
+		configured = bootstrap
+		if !filepath.IsAbs(configured) {
+			absolute, absErr := filepath.Abs(configured)
+			if absErr != nil {
+				return "", absErr
+			}
+			configured = absolute
+		}
+		if err = os.MkdirAll(configured, 0755); err != nil {
+			return "", fmt.Errorf("创建根目录失败: %w", err)
+		}
+		configured, err = filepath.EvalSymlinks(configured)
+		if err != nil {
+			return "", err
+		}
+		_, err = db.Exec(`INSERT INTO settings(key,value) VALUES('root_dir',?)`, configured)
+		if err != nil {
+			return "", err
+		}
+		return configured, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	absolute, err := filepath.Abs(configured)
+	if err != nil {
+		return "", err
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(absolute); resolveErr == nil {
+		return resolved, nil
+	}
+	log.Printf("警告：SQLite 中配置的根目录当前不存在或不可访问: %s", absolute)
+	return absolute, nil
 }
 
 func randomPassword(length int) string {
@@ -609,9 +650,60 @@ func boolInt(v bool) int {
 	return 0
 }
 
+func (s *Server) currentRoot() string { s.rootMu.RLock(); defer s.rootMu.RUnlock(); return s.root }
+
+func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		root := s.currentRoot()
+		info, err := os.Stat(root)
+		writeJSON(w, map[string]any{"root_dir": filepath.ToSlash(root), "exists": err == nil && info.IsDir()})
+	case http.MethodPut:
+		var req struct {
+			RootDir string `json:"root_dir"`
+		}
+		if json.NewDecoder(r.Body).Decode(&req) != nil {
+			jsonError(w, "请求格式错误", 400)
+			return
+		}
+		value := strings.TrimSpace(req.RootDir)
+		if value == "" {
+			jsonError(w, "目录不能为空", 400)
+			return
+		}
+		absolute, err := filepath.Abs(value)
+		if err != nil {
+			jsonError(w, "目录路径无效", 400)
+			return
+		}
+		info, err := os.Stat(absolute)
+		if err != nil || !info.IsDir() {
+			jsonError(w, "目录不存在或不是文件夹", 400)
+			return
+		}
+		resolved, err := filepath.EvalSymlinks(absolute)
+		if err != nil {
+			jsonError(w, "无法访问该目录", 400)
+			return
+		}
+		if _, err = s.db.Exec(`INSERT INTO settings(key,value) VALUES('root_dir',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, resolved); err != nil {
+			jsonError(w, "保存设置失败", 500)
+			return
+		}
+		s.rootMu.Lock()
+		s.root = resolved
+		s.rootMu.Unlock()
+		log.Printf("管理员 %s 将根目录修改为: %s", currentUser(r).Username, resolved)
+		writeJSON(w, map[string]any{"ok": true, "root_dir": filepath.ToSlash(resolved)})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
 // resolve 将浏览器中的 UTF-8、正斜杠相对路径安全映射到 Windows 原生路径。
 // filepath.Rel 检查和 EvalSymlinks 检查共同阻止 .. 及目录联接逃逸根目录。
 func (s *Server) resolve(rel string, allowMissing bool) (string, error) {
+	root := s.currentRoot()
 	rel = strings.TrimPrefix(strings.ReplaceAll(rel, "\\", "/"), "/")
 	clean := filepath.Clean(filepath.FromSlash(rel))
 	if clean == "." {
@@ -620,8 +712,8 @@ func (s *Server) resolve(rel string, allowMissing bool) (string, error) {
 	if filepath.IsAbs(clean) {
 		return "", errors.New("不允许绝对路径")
 	}
-	p := filepath.Join(s.root, clean)
-	back, err := filepath.Rel(s.root, p)
+	p := filepath.Join(root, clean)
+	back, err := filepath.Rel(root, p)
 	if err != nil || back == ".." || strings.HasPrefix(back, ".."+string(os.PathSeparator)) {
 		return "", errors.New("路径越界")
 	}
@@ -633,7 +725,7 @@ func (s *Server) resolve(rel string, allowMissing bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	back, err = filepath.Rel(s.root, resolved)
+	back, err = filepath.Rel(root, resolved)
 	if err != nil || back == ".." || strings.HasPrefix(back, ".."+string(os.PathSeparator)) {
 		return "", errors.New("路径越界")
 	}
@@ -701,19 +793,57 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 			jsonError(w, "读取上传失败", 400)
 			return
 		}
+		formName := part.FormName()
+		if strings.HasPrefix(formName, "dir:") {
+			relName, decodeErr := url.QueryUnescape(strings.TrimPrefix(formName, "dir:"))
+			part.Close()
+			if decodeErr != nil {
+				jsonError(w, "目录名称编码错误", 400)
+				return
+			}
+			target, targetErr := safeUploadTarget(dir, relName, true)
+			if targetErr != nil {
+				jsonError(w, targetErr.Error(), 400)
+				return
+			}
+			if err := os.MkdirAll(target, 0755); err != nil {
+				jsonError(w, "创建目录失败", 500)
+				return
+			}
+			continue
+		}
 		if part.FileName() == "" {
 			part.Close()
 			continue
 		}
-		name := filepath.Base(strings.ReplaceAll(part.FileName(), "\\", "/"))
+		name := part.FileName()
+		if strings.HasPrefix(formName, "file:") {
+			if decoded, decodeErr := url.QueryUnescape(strings.TrimPrefix(formName, "file:")); decodeErr == nil {
+				name = decoded
+			} else {
+				part.Close()
+				jsonError(w, "文件路径编码错误", 400)
+				return
+			}
+		}
 		if name == "." || name == "" {
 			part.Close()
 			continue
 		}
-		target := filepath.Join(dir, name)
+		target, targetErr := safeUploadTarget(dir, name, false)
+		if targetErr != nil {
+			part.Close()
+			jsonError(w, targetErr.Error(), 400)
+			return
+		}
 		if existing, statErr := os.Lstat(target); statErr == nil && existing.Mode()&os.ModeSymlink != 0 {
 			part.Close()
 			jsonError(w, "拒绝覆盖符号链接: "+name, 400)
+			return
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			part.Close()
+			jsonError(w, "创建上传目录失败", 500)
 			return
 		}
 		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
@@ -733,6 +863,142 @@ func (s *Server) uploadHandler(w http.ResponseWriter, r *http.Request) {
 		count++
 	}
 	writeJSON(w, map[string]any{"ok": true, "count": count})
+}
+
+func safeUploadTarget(baseDir, relative string, directory bool) (string, error) {
+	relative = strings.Trim(strings.ReplaceAll(relative, "\\", "/"), "/")
+	if relative == "" {
+		return "", errors.New("名称不能为空")
+	}
+	parts := strings.Split(relative, "/")
+	current := baseDir
+	for i, part := range parts {
+		if part == "" || part == "." || part == ".." || strings.Contains(part, ":") {
+			return "", errors.New("包含无效路径")
+		}
+		current = filepath.Join(current, part)
+		if i < len(parts)-1 || directory {
+			if info, err := os.Lstat(current); err == nil {
+				if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+					return "", errors.New("上传路径包含无效目录")
+				}
+			} else if !os.IsNotExist(err) {
+				return "", err
+			}
+		}
+	}
+	back, err := filepath.Rel(baseDir, current)
+	if err != nil || back == ".." || strings.HasPrefix(back, ".."+string(os.PathSeparator)) {
+		return "", errors.New("上传路径越界")
+	}
+	return current, nil
+}
+
+func (s *Server) mkdirHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	var req struct {
+		Path string `json:"path"`
+		Name string `json:"name"`
+	}
+	if json.NewDecoder(r.Body).Decode(&req) != nil {
+		jsonError(w, "请求格式错误", 400)
+		return
+	}
+	dir, err := s.resolve(req.Path, false)
+	if err != nil {
+		jsonError(w, "当前路径无效", 400)
+		return
+	}
+	target, err := safeUploadTarget(dir, strings.TrimSpace(req.Name), true)
+	if err != nil {
+		jsonError(w, err.Error(), 400)
+		return
+	}
+	if _, err = os.Stat(target); err == nil {
+		jsonError(w, "同名目录或文件已存在", 409)
+		return
+	}
+	if err = os.MkdirAll(target, 0755); err != nil {
+		jsonError(w, "创建目录失败", 500)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (s *Server) deleteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		methodNotAllowed(w)
+		return
+	}
+	rel := strings.TrimSpace(r.URL.Query().Get("path"))
+	if rel == "" || filepath.Clean(filepath.FromSlash(rel)) == "." {
+		jsonError(w, "禁止删除共享根目录", 400)
+		return
+	}
+	target, err := s.resolve(rel, false)
+	if err != nil {
+		jsonError(w, "对象不存在或路径无效", 404)
+		return
+	}
+	if err = os.RemoveAll(target); err != nil {
+		jsonError(w, "删除失败: "+err.Error(), 500)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (s *Server) renameHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	var req struct {
+		Path string `json:"path"`
+		Name string `json:"name"`
+	}
+	if json.NewDecoder(r.Body).Decode(&req) != nil {
+		jsonError(w, "请求格式错误", 400)
+		return
+	}
+	if strings.TrimSpace(req.Path) == "" {
+		jsonError(w, "禁止重命名共享根目录", 400)
+		return
+	}
+	source, err := s.resolve(req.Path, false)
+	if err != nil {
+		jsonError(w, "目录不存在或路径无效", 404)
+		return
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		jsonError(w, "对象不存在", 404)
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	target, err := safeUploadTarget(filepath.Dir(source), name, info.IsDir())
+	if err != nil {
+		jsonError(w, err.Error(), 400)
+		return
+	}
+	if strings.EqualFold(filepath.Clean(source), filepath.Clean(target)) && source == target {
+		writeJSON(w, map[string]bool{"ok": true})
+		return
+	}
+	if _, err = os.Stat(target); err == nil {
+		jsonError(w, "同名目录或文件已存在", 409)
+		return
+	} else if !os.IsNotExist(err) {
+		jsonError(w, "无法检查目标目录", 500)
+		return
+	}
+	if err = os.Rename(source, target); err != nil {
+		jsonError(w, "重命名失败: "+err.Error(), 500)
+		return
+	}
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 func (s *Server) rawHandler(w http.ResponseWriter, r *http.Request)      { s.serveFile(w, r, true) }
@@ -832,8 +1098,9 @@ func (s *Server) zipHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := info.Name()
-	if p == s.root {
-		name = filepath.Base(s.root)
+	root := s.currentRoot()
+	if p == root {
+		name = filepath.Base(root)
 	}
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", `attachment; filename="folder.zip"; filename*=UTF-8''`+url.PathEscape(name+".zip"))

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -28,6 +30,54 @@ func TestResolveChinesePathAndTraversal(t *testing.T) {
 	}
 	if _, err = s.resolve("../secret.txt", false); err == nil {
 		t.Fatal("路径穿越未被拒绝")
+	}
+}
+
+func TestRenameAndDeleteHandlers(t *testing.T) {
+	root := t.TempDir()
+	oldDir := filepath.Join(root, "旧目录")
+	if err := os.Mkdir(oldDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{root: root}
+	body := []byte(`{"path":"旧目录","name":"新目录"}`)
+	r := httptest.NewRequest("POST", "/api/rename", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	s.renameHandler(w, r)
+	if w.Code != 200 {
+		t.Fatalf("重命名失败 %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "新目录")); err != nil {
+		t.Fatalf("新目录不存在: %v", err)
+	}
+	oldFile := filepath.Join(root, "旧文件.txt")
+	if err := os.WriteFile(oldFile, []byte("ok"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	body = []byte(`{"path":"旧文件.txt","name":"新文件.txt"}`)
+	r = httptest.NewRequest("POST", "/api/rename", bytes.NewReader(body))
+	w = httptest.NewRecorder()
+	s.renameHandler(w, r)
+	if w.Code != 200 {
+		t.Fatalf("文件重命名失败 %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "新文件.txt")); err != nil {
+		t.Fatalf("新文件不存在: %v", err)
+	}
+	r = httptest.NewRequest("DELETE", "/api/delete?path="+url.QueryEscape("新目录"), nil)
+	w = httptest.NewRecorder()
+	s.deleteHandler(w, r)
+	if w.Code != 200 {
+		t.Fatalf("删除失败 %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "新目录")); !os.IsNotExist(err) {
+		t.Fatal("目录未被删除")
+	}
+	r = httptest.NewRequest("DELETE", "/api/delete?path=", nil)
+	w = httptest.NewRecorder()
+	s.deleteHandler(w, r)
+	if w.Code != 400 {
+		t.Fatalf("删除根目录应返回 400，实际 %d", w.Code)
 	}
 }
 
